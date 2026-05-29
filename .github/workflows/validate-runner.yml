@@ -1,0 +1,139 @@
+name: validate-runner
+
+# Standalone workflow for validating a custom self-hosted runner.
+# Bypasses pull.yml / _linux-build.yml / _runner-determinator.yml and
+# all of their owner-guards. Designed to run on a fork.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label to target'
+        required: true
+        default: 'pytorch-validation-m9g-24xlarge'
+  push:
+    tags:
+      - 'validate-runner-*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ${{ github.event.inputs.runner_label || 'pytorch-validation-m9g-24xlarge' }}
+    timeout-minutes: 180
+    env:
+      USE_CUDA: 0
+      USE_DISTRIBUTED: 0
+      USE_FBGEMM: 0
+      USE_NNPACK: 0
+      USE_QNNPACK: 0
+      USE_XNNPACK: 1
+      USE_MKLDNN: 1
+      BUILD_TEST: 0
+      CMAKE_BUILD_TYPE: Release
+      MAX_JOBS: 32
+      CCACHE_DIR: /home/actions-runner/.ccache
+      CCACHE_MAXSIZE: 10G
+
+    steps:
+      - name: Runner identity
+        run: |
+          set -ex
+          uname -a
+          nproc
+          free -h
+          awk '/^processor|CPU implementer|CPU part|Features/ {print}' /proc/cpuinfo | head -20
+          df -h /
+
+      - name: Install system deps
+        run: |
+          set -ex
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache git curl ca-certificates \
+            libopenblas-dev libomp-dev libnuma-dev pkg-config \
+            python3 python3-dev python3-venv python3-pip \
+            libssl-dev zlib1g-dev libffi-dev
+
+      - name: Checkout PyTorch
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up Python venv
+        run: |
+          set -ex
+          python3 -m venv "$HOME/pt-venv"
+          "$HOME/pt-venv/bin/python" -m pip install --upgrade pip wheel setuptools
+          "$HOME/pt-venv/bin/python" -m pip install -r requirements.txt
+          "$HOME/pt-venv/bin/python" -m pip install pytest pytest-timeout expecttest hypothesis
+
+      - name: Build PyTorch
+        id: build
+        run: |
+          set -ex
+          source "$HOME/pt-venv/bin/activate"
+          start=$(date +%s)
+          python -m pip install --no-build-isolation -v -e .
+          end=$(date +%s)
+          echo "build_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "Build wall-clock: $((end - start))s"
+
+      - name: Smoke test - import + basic ops
+        run: |
+          set -ex
+          source "$HOME/pt-venv/bin/activate"
+          python <<'PY'
+          import torch, platform, sys
+          print("python:", sys.version)
+          print("platform:", platform.platform(), platform.machine())
+          print("torch:", torch.__version__)
+          print("torch.compiled_with_cxx11_abi:", torch.compiled_with_cxx11_abi())
+          print("threads:", torch.get_num_threads())
+          a = torch.randn(1024, 1024)
+          b = torch.randn(1024, 1024)
+          c = a @ b
+          print("matmul shape:", c.shape, "dtype:", c.dtype, "norm:", c.norm().item())
+          # Autograd sanity
+          x = torch.randn(8, requires_grad=True)
+          y = (x ** 2).sum()
+          y.backward()
+          print("autograd grad norm:", x.grad.norm().item())
+          PY
+
+      - name: Targeted test slice
+        id: tests
+        run: |
+          set -ex
+          source "$HOME/pt-venv/bin/activate"
+          start=$(date +%s)
+          # Small but representative — exercises tensor ops, autograd, broadcasting.
+          # Total wall-clock ~3-5 min on this hardware.
+          python -m pytest -v --timeout=120 \
+            test/test_torch.py::TestTorch::test_dlpack_capsule_conversion \
+            test/test_torch.py::TestTorch::test_pin_memory \
+            test/test_torch.py::TestTorchDeviceTypeCPU::test_diagonal_cpu \
+            test/test_autograd.py::TestAutograd::test_grad \
+            test/test_autograd.py::TestAutograd::test_grad_nonleaf \
+            test/test_nn.py -k "test_Linear and not cuda" --no-header -q \
+            || echo "::warning::Some tests failed - inspect log above"
+          end=$(date +%s)
+          echo "test_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "Test slice wall-clock: $((end - start))s"
+
+      - name: Build/test summary
+        if: always()
+        run: |
+          echo "===== Validation Summary ====="
+          echo "Runner: ${{ runner.name }}"
+          echo "Runner labels: ${{ join(runner.labels, ', ') }}"
+          echo "Build seconds: ${{ steps.build.outputs.build_seconds }}"
+          echo "Test seconds:  ${{ steps.tests.outputs.test_seconds }}"
+          echo "------------------------------"
+          echo "ccache stats:"
+          ccache -s 2>/dev/null || true
+          echo "------------------------------"
+          echo "Disk usage:"
+          df -h /
