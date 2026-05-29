@@ -112,23 +112,27 @@ jobs:
           source "$HOME/pt-venv/bin/activate"
           start=$(date +%s)
 
-          # Use -k keyword filters with names that exist in current pytorch master
-          # (verified against test/test_autograd.py). These are stable autograd
-          # tests that exercise tensor ops, autograd machinery, and grad modes.
-          KEYWORD='test_simple_reentrant or test_grad_nonleaf or test_set_grad_enabled or test_grad_materialize_grads'
+          # Run the full TestAutograd class (~300 tests). Excludes the device-typed
+          # subclasses (TestAutogradDeviceTypeCPU/CUDA) which contain CUDA-only
+          # cases. Setting TEST_WITH_TORCHDYNAMO=0 disables the dynamo-decorated
+          # skips so we exercise the eager autograd codepath.
+          export TEST_WITH_TORCHDYNAMO=0
+          export TEST_WITH_ASAN=0
+          export TEST_WITH_SLOW=0
 
           echo "===== Test collection (sanity check) ====="
           set -x
-          python -m pytest test/test_autograd.py -k "$KEYWORD" --collect-only -q
+          python -m pytest test/test_autograd.py::TestAutograd --collect-only -q | tail -5
           set +x
 
           echo
-          echo "===== Running tests ====="
+          echo "===== Running TestAutograd ====="
           set -x
           set +e
-          python -m pytest test/test_autograd.py \
-              -k "$KEYWORD" \
-              -v --timeout=120 --no-header
+          python -m pytest test/test_autograd.py::TestAutograd \
+              -v --timeout=300 --no-header \
+              -rs --maxfail=20 \
+              --tb=short
           test_rc=$?
           set -e
           set +x
@@ -138,12 +142,13 @@ jobs:
           echo "test_exit_code=$test_rc" >> "$GITHUB_OUTPUT"
           echo "Test slice wall-clock: $((end - start))s, exit code: $test_rc"
 
-          # pytest exit codes: 0=all passed, 1=tests failed, 5=no tests collected.
-          # Treat 5 (no tests collected) as a hard failure since it means our
-          # filter is broken. Treat 1 (test failures) as a soft warning so the
-          # workflow still succeeds and we can inspect the failures.
+          # pytest exit codes: 0=all passed, 1=tests failed, 2=interrupted,
+          # 5=no tests collected.
           if [ "$test_rc" = "5" ]; then
-              echo "::error::No tests were collected — pytest -k filter matched nothing. Failing the job."
+              echo "::error::No tests were collected — pytest filter is broken."
+              exit 1
+          elif [ "$test_rc" = "2" ]; then
+              echo "::error::pytest was interrupted (probably hit --maxfail)."
               exit 1
           elif [ "$test_rc" != "0" ]; then
               echo "::warning::pytest exited with code $test_rc — inspect log above for failures"
