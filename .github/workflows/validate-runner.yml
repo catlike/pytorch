@@ -112,27 +112,29 @@ jobs:
           source "$HOME/pt-venv/bin/activate"
           start=$(date +%s)
 
-          # Run the full TestAutograd class (~300 tests). Excludes the device-typed
-          # subclasses (TestAutogradDeviceTypeCPU/CUDA) which contain CUDA-only
-          # cases. Setting TEST_WITH_TORCHDYNAMO=0 disables the dynamo-decorated
-          # skips so we exercise the eager autograd codepath.
+          # Run the entire test_autograd.py file (~1000 tests across all classes:
+          # TestAutograd, TestAutogradForwardMode, TestAllowMutationOnSaved,
+          # TestAutogradInferenceMode, TestMultithreadAutograd, TestNestedCheckpoint,
+          # TestSelectiveActivationCheckpoint, TestAutogradDeviceTypeCPU, etc).
+          # Excludes CUDA classes since they only get instantiated when CUDA is
+          # available, and we built with USE_CUDA=0.
           export TEST_WITH_TORCHDYNAMO=0
           export TEST_WITH_ASAN=0
           export TEST_WITH_SLOW=0
 
           echo "===== Test collection (sanity check) ====="
           set -x
-          python -m pytest test/test_autograd.py::TestAutograd --collect-only -q | tail -5
+          python -m pytest test/test_autograd.py --collect-only -q 2>&1 | tail -3
           set +x
 
           echo
-          echo "===== Running TestAutograd ====="
+          echo "===== Running test_autograd.py ====="
           set -x
           set +e
-          python -m pytest test/test_autograd.py::TestAutograd \
-              -v --timeout=300 --no-header \
-              -rs --maxfail=20 \
-              --tb=short
+          python -m pytest test/test_autograd.py \
+              --timeout=300 --no-header \
+              -rs --maxfail=30 \
+              --tb=short -q
           test_rc=$?
           set -e
           set +x
@@ -152,6 +154,7 @@ jobs:
               exit 1
           elif [ "$test_rc" != "0" ]; then
               echo "::warning::pytest exited with code $test_rc — inspect log above for failures"
+              exit 1
           fi
 
       - name: Build/test summary
