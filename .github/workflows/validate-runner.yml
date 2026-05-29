@@ -108,22 +108,46 @@ jobs:
       - name: Targeted test slice
         id: tests
         run: |
-          set -ex
+          set -e
           source "$HOME/pt-venv/bin/activate"
           start=$(date +%s)
-          # Small but representative — exercises tensor ops, autograd, broadcasting.
-          # Total wall-clock ~3-5 min on this hardware.
-          python -m pytest -v --timeout=120 \
-            test/test_torch.py::TestTorch::test_dlpack_capsule_conversion \
-            test/test_torch.py::TestTorch::test_pin_memory \
-            test/test_torch.py::TestTorchDeviceTypeCPU::test_diagonal_cpu \
-            test/test_autograd.py::TestAutograd::test_grad \
-            test/test_autograd.py::TestAutograd::test_grad_nonleaf \
-            test/test_nn.py -k "test_Linear and not cuda" --no-header -q \
-            || echo "::warning::Some tests failed - inspect log above"
+
+          # Use -k keyword filters with names that exist in current pytorch master
+          # (verified against test/test_autograd.py). These are stable autograd
+          # tests that exercise tensor ops, autograd machinery, and grad modes.
+          KEYWORD='test_simple_reentrant or test_grad_nonleaf or test_set_grad_enabled or test_grad_materialize_grads'
+
+          echo "===== Test collection (sanity check) ====="
+          set -x
+          python -m pytest test/test_autograd.py -k "$KEYWORD" --collect-only -q
+          set +x
+
+          echo
+          echo "===== Running tests ====="
+          set -x
+          set +e
+          python -m pytest test/test_autograd.py \
+              -k "$KEYWORD" \
+              -v --timeout=120 --no-header
+          test_rc=$?
+          set -e
+          set +x
+
           end=$(date +%s)
           echo "test_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
-          echo "Test slice wall-clock: $((end - start))s"
+          echo "test_exit_code=$test_rc" >> "$GITHUB_OUTPUT"
+          echo "Test slice wall-clock: $((end - start))s, exit code: $test_rc"
+
+          # pytest exit codes: 0=all passed, 1=tests failed, 5=no tests collected.
+          # Treat 5 (no tests collected) as a hard failure since it means our
+          # filter is broken. Treat 1 (test failures) as a soft warning so the
+          # workflow still succeeds and we can inspect the failures.
+          if [ "$test_rc" = "5" ]; then
+              echo "::error::No tests were collected — pytest -k filter matched nothing. Failing the job."
+              exit 1
+          elif [ "$test_rc" != "0" ]; then
+              echo "::warning::pytest exited with code $test_rc — inspect log above for failures"
+          fi
 
       - name: Build/test summary
         if: always()
@@ -131,8 +155,9 @@ jobs:
           echo "===== Validation Summary ====="
           echo "Runner: ${{ runner.name }}"
           echo "Runner labels: ${{ join(runner.labels, ', ') }}"
-          echo "Build seconds: ${{ steps.build.outputs.build_seconds }}"
-          echo "Test seconds:  ${{ steps.tests.outputs.test_seconds }}"
+          echo "Build seconds:    ${{ steps.build.outputs.build_seconds }}"
+          echo "Test seconds:     ${{ steps.tests.outputs.test_seconds }}"
+          echo "Test exit code:   ${{ steps.tests.outputs.test_exit_code }}"
           echo "------------------------------"
           echo "ccache stats:"
           ccache -s 2>/dev/null || true
