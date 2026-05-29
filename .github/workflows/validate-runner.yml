@@ -35,6 +35,8 @@ jobs:
       MAX_JOBS: 32
       CCACHE_DIR: /home/actions-runner/.ccache
       CCACHE_MAXSIZE: 10G
+      CC: /usr/bin/gcc-13
+      CXX: /usr/bin/g++-13
 
     steps:
       - name: Runner identity
