@@ -1,0 +1,261 @@
+name: validate-runner-docker
+
+# Runs inside upstream PyTorch's aarch64 CI Docker image
+# (ghcr.io/pytorch/ci-image:pytorch-linux-jammy-aarch64-py3.10-gcc13-<hash>).
+# This is the same image used by the upstream linux-jammy-aarch64-py3.10
+# CI shard, so it brings the same toolchain (gcc-13), python (3.10 conda),
+# and pre-installed deps. Bypasses the bare-metal pip install path entirely.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label to target'
+        required: true
+        default: 'pytorch-validation-m9g-24xlarge'
+      tests_to_run:
+        description: 'Pytest target(s) inside the container'
+        required: false
+        default: 'test/test_autograd.py'
+  push:
+    tags:
+      - 'validate-runner-docker-*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ${{ github.event.inputs.runner_label || 'pytorch-validation-m9g-24xlarge' }}
+    timeout-minutes: 240
+
+    steps:
+      - name: Runner identity
+        run: |
+          set -ex
+          uname -a
+          nproc
+          free -h
+          awk '/^processor|CPU implementer|CPU part|Features/ {print}' /proc/cpuinfo | head -20
+          df -h /
+
+      - name: Install Docker if missing
+        run: |
+          set -ex
+          if ! command -v docker >/dev/null; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              docker.io ca-certificates curl
+          fi
+          docker --version
+          # Ensure the runner user can talk to docker socket without sudo
+          if ! groups actions-runner | grep -q docker; then
+            sudo usermod -aG docker actions-runner || true
+          fi
+          # Use sudo for docker commands within this job (avoids needing a re-login)
+          sudo systemctl start docker || true
+          sudo docker version
+
+      - name: Checkout PyTorch
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Compute docker image tag
+        id: docker-image
+        run: |
+          set -ex
+          # The ci-docker-hash is the git tree hash of .ci/docker. Upstream's
+          # calculate-docker-image action uses the same convention.
+          DOCKER_HASH=$(git rev-parse HEAD:.ci/docker)
+          IMAGE_NAME="pytorch-linux-jammy-aarch64-py3.10-gcc13"
+          # Public mirror format: ghcr.io/pytorch/ci-image:NAME-HASH
+          PUBLIC_IMAGE="ghcr.io/pytorch/ci-image:${IMAGE_NAME}-${DOCKER_HASH}"
+          echo "DOCKER_HASH: $DOCKER_HASH"
+          echo "PUBLIC_IMAGE: $PUBLIC_IMAGE"
+          echo "docker_hash=$DOCKER_HASH" >> "$GITHUB_OUTPUT"
+          echo "image=$PUBLIC_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Pull docker image
+        id: pull
+        run: |
+          set -ex
+          IMAGE='${{ steps.docker-image.outputs.image }}'
+          # Retry the pull a few times — first pull pulls ~5GB and can hit
+          # transient registry hiccups.
+          for i in 1 2 3; do
+            if sudo docker pull "$IMAGE"; then
+              echo "Pulled $IMAGE on attempt $i"
+              exit 0
+            fi
+            echo "Pull attempt $i failed, retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::Failed to pull $IMAGE after 3 attempts"
+          exit 1
+
+      - name: Start container
+        id: start
+        run: |
+          set -ex
+          IMAGE='${{ steps.docker-image.outputs.image }}'
+          # Mirror upstream's docker run invocation closely:
+          # - workspace mounted to /var/lib/jenkins/workspace
+          # - run as jenkins user
+          # - tty + detached so we can docker exec into it across multiple steps
+          # - SCCACHE_* unset so the build doesn't try to talk to S3 we can't reach
+          CONTAINER_ID=$(sudo docker run \
+            --detach \
+            --tty \
+            --user jenkins \
+            -v "${GITHUB_WORKSPACE}:/var/lib/jenkins/workspace" \
+            -w /var/lib/jenkins/workspace \
+            -e BUILD_ENVIRONMENT=linux-jammy-aarch64-py3.10-gcc13 \
+            -e MAX_JOBS="$(nproc --ignore=2)" \
+            -e SKIP_SCCACHE_INITIALIZATION=1 \
+            -e SHARD_NUMBER=1 \
+            -e NUM_TEST_SHARDS=1 \
+            -e TEST_CONFIG=default \
+            --memory="${TOTAL_AVAILABLE_MEMORY_IN_GB:-300}g" \
+            --security-opt seccomp=unconfined \
+            --cap-add=SYS_PTRACE \
+            "$IMAGE" \
+            sleep infinity)
+          echo "Container ID: $CONTAINER_ID"
+          echo "container_id=$CONTAINER_ID" >> "$GITHUB_OUTPUT"
+          # Quick environment dump
+          sudo docker exec "$CONTAINER_ID" bash -c 'whoami && pwd && ls /var/lib/jenkins/workspace | head'
+
+      - name: Container env smoke check
+        run: |
+          set -ex
+          CID='${{ steps.start.outputs.container_id }}'
+          sudo docker exec "$CID" bash -c '
+            set -ex
+            echo "===== Python ====="
+            python --version
+            which python
+            echo "===== GCC ====="
+            gcc --version | head -2
+            echo "===== CMake ====="
+            cmake --version | head -1
+            echo "===== Conda ====="
+            conda --version 2>/dev/null || echo "(no conda)"
+            echo "===== CPU info ====="
+            awk "/^CPU part|^Features/ {print; exit}" /proc/cpuinfo | head -2
+            echo "===== Workspace ====="
+            ls -la /var/lib/jenkins/workspace | head -10
+          '
+
+      - name: Build PyTorch (.ci/pytorch/build.sh)
+        id: build
+        run: |
+          set -e
+          CID='${{ steps.start.outputs.container_id }}'
+          start=$(date +%s)
+          set -x
+          # Exits non-zero on failure; build.sh has set -e
+          sudo docker exec "$CID" bash -c '
+            cd /var/lib/jenkins/workspace
+            git config --global --add safe.directory /var/lib/jenkins/workspace
+            ./.ci/pytorch/build.sh
+          ' 2>&1 | tee /tmp/build.log
+          rc=${PIPESTATUS[0]}
+          set +x
+          end=$(date +%s)
+          echo "build_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "build_exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "Build wall-clock: $((end - start))s, exit code: $rc"
+          if [ "$rc" != "0" ]; then
+            echo "::error::Build failed; last 80 lines of build.log:"
+            tail -80 /tmp/build.log
+            exit "$rc"
+          fi
+
+      - name: Smoke test - import + basic ops
+        run: |
+          set -ex
+          CID='${{ steps.start.outputs.container_id }}'
+          sudo docker exec "$CID" bash -c '
+            python <<PY
+          import torch, platform, sys
+          print("python:", sys.version)
+          print("platform:", platform.platform(), platform.machine())
+          print("torch:", torch.__version__)
+          print("torch.compiled_with_cxx11_abi:", torch.compiled_with_cxx11_abi())
+          print("threads:", torch.get_num_threads())
+          a = torch.randn(1024, 1024)
+          b = torch.randn(1024, 1024)
+          c = a @ b
+          print("matmul shape:", c.shape, "dtype:", c.dtype, "norm:", c.norm().item())
+          x = torch.randn(8, requires_grad=True)
+          y = (x ** 2).sum()
+          y.backward()
+          print("autograd grad norm:", x.grad.norm().item())
+          PY
+          '
+
+      - name: Targeted test slice
+        id: tests
+        run: |
+          set -e
+          CID='${{ steps.start.outputs.container_id }}'
+          TESTS='${{ github.event.inputs.tests_to_run || ''test/test_autograd.py'' }}'
+          start=$(date +%s)
+
+          set -x
+          set +e
+          sudo docker exec "$CID" bash -c "
+            cd /var/lib/jenkins/workspace
+            export PYTORCH_TEST_WITH_DYNAMO=0
+            export TEST_WITH_TORCHDYNAMO=0
+            export TEST_WITH_SLOW=0
+            python -m pytest $TESTS \
+              --timeout=300 --no-header \
+              -rs --maxfail=30 \
+              --tb=short -q
+          "
+          test_rc=$?
+          set -e
+          set +x
+
+          end=$(date +%s)
+          echo "test_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "test_exit_code=$test_rc" >> "$GITHUB_OUTPUT"
+          echo "Test slice wall-clock: $((end - start))s, exit code: $test_rc"
+
+          if [ "$test_rc" = "5" ]; then
+              echo "::error::No tests collected"
+              exit 1
+          elif [ "$test_rc" = "2" ]; then
+              echo "::error::pytest interrupted (likely --maxfail)"
+              exit 1
+          elif [ "$test_rc" != "0" ]; then
+              echo "::warning::pytest exited with code $test_rc — see log above"
+              exit 1
+          fi
+
+      - name: Stop container
+        if: always()
+        run: |
+          set -ex
+          CID='${{ steps.start.outputs.container_id }}'
+          if [ -n "$CID" ]; then
+            sudo docker stop "$CID" || true
+            sudo docker rm "$CID" || true
+          fi
+
+      - name: Build/test summary
+        if: always()
+        run: |
+          echo "===== Validation Summary (docker) ====="
+          echo "Runner:           ${{ runner.name }}"
+          echo "Image:            ${{ steps.docker-image.outputs.image }}"
+          echo "Build seconds:    ${{ steps.build.outputs.build_seconds }}"
+          echo "Build exit code:  ${{ steps.build.outputs.build_exit_code }}"
+          echo "Test seconds:     ${{ steps.tests.outputs.test_seconds }}"
+          echo "Test exit code:   ${{ steps.tests.outputs.test_exit_code }}"
+          echo "------------------------------"
+          echo "Disk usage:"
+          df -h /
