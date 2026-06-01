@@ -208,23 +208,31 @@ jobs:
           TESTS="${{ github.event.inputs.tests_to_run || 'test/test_autograd.py' }}"
           start=$(date +%s)
 
-          # Use upstream's test/run_test.py orchestrator for max CI fidelity.
-          # It handles path setup, env vars, and matches what _linux-test.yml
-          # does internally. We pass --include with the bare test name (no .py
-          # extension and no test/ prefix), which is run_test.py's expected form.
-          # E.g. test/test_autograd.py -> --include test_autograd
-          INCLUDE_NAME=$(echo "$TESTS" | sed -E 's|^test/||; s|\.py$||; s|::.*||')
-
+          # run_test.py expects to write into test/test-reports. The workspace
+          # is owned by the host's actions-runner UID; jenkins inside the
+          # container can't write to it. Chown matches what upstream's test.sh
+          # does (with a corresponding chown-back at the end so the host
+          # actions-runner can clean up).
           set -x
           set +e
-          sudo docker exec "$CID" bash -c "
+          sudo docker exec -e BUILD_ENVIRONMENT=linux-jammy-aarch64-py3.10-gcc13 \
+                          -e PYTORCH_TEST_WITH_DYNAMO=0 \
+                          -e TEST_WITH_TORCHDYNAMO=0 \
+                          -e TEST_WITH_SLOW=0 \
+                          "$CID" bash -c "
+            set -e
+            sudo chown -R jenkins /var/lib/jenkins/workspace
+            git config --global --add safe.directory /var/lib/jenkins/workspace
             cd /var/lib/jenkins/workspace
-            export PYTORCH_TEST_WITH_DYNAMO=0
-            export TEST_WITH_TORCHDYNAMO=0
-            export TEST_WITH_SLOW=0
-            python test/run_test.py --include $INCLUDE_NAME --verbose 2>&1 | tail -200
+            INCLUDE_NAME=\$(echo '$TESTS' | sed -E 's|^test/||; s|\\.py\$||; s|::.*||')
+            echo \"Running upstream run_test.py --include \$INCLUDE_NAME\"
+            python test/run_test.py --include \$INCLUDE_NAME --verbose
           "
           test_rc=$?
+          # Restore host ownership so post-checkout cleanup doesn't choke.
+          sudo docker exec "$CID" bash -c '
+            sudo chown -R 1001:1001 /var/lib/jenkins/workspace || true
+          ' || true
           set -e
           set +x
 
