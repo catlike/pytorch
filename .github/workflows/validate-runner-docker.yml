@@ -213,6 +213,11 @@ jobs:
           # container can't write to it. Chown matches what upstream's test.sh
           # does (with a corresponding chown-back at the end so the host
           # actions-runner can clean up).
+          #
+          # Also: the docker image ships scipy compiled against numpy<2 but
+          # numpy 2.0.2 is installed — when test_autograd.py imports
+          # torch.testing._internal.common_methods_invocations, that pulls
+          # scipy.fft -> scipy.special -> ABI error. Pin numpy to <2 first.
           set -x
           set +e
           sudo docker exec -e BUILD_ENVIRONMENT=linux-jammy-aarch64-py3.10-gcc13 \
@@ -224,6 +229,9 @@ jobs:
             sudo chown -R jenkins /var/lib/jenkins/workspace
             git config --global --add safe.directory /var/lib/jenkins/workspace
             cd /var/lib/jenkins/workspace
+            # Fix scipy/numpy ABI incompatibility in the image
+            python -c 'import scipy.special._ufuncs' 2>&1 | head -2 || \\
+                pip install --quiet 'numpy<2'
             INCLUDE_NAME=\$(echo '$TESTS' | sed -E 's|^test/||; s|\\.py\$||; s|::.*||')
             echo \"Running upstream run_test.py --include \$INCLUDE_NAME\"
             python test/run_test.py --include \$INCLUDE_NAME --verbose
