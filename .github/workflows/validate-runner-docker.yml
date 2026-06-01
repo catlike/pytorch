@@ -177,12 +177,16 @@ jobs:
         run: |
           set -ex
           CID='${{ steps.start.outputs.container_id }}'
+          # cd to /tmp so Python doesn't pick up /var/lib/jenkins/workspace/torch
+          # (the source tree) ahead of the installed wheel in site-packages.
           sudo docker exec "$CID" bash -c '
+            cd /tmp
             python <<PY
           import torch, platform, sys
           print("python:", sys.version)
           print("platform:", platform.platform(), platform.machine())
           print("torch:", torch.__version__)
+          print("torch path:", torch.__file__)
           print("torch.compiled_with_cxx11_abi:", torch.compiled_with_cxx11_abi())
           print("threads:", torch.get_num_threads())
           a = torch.randn(1024, 1024)
@@ -204,6 +208,13 @@ jobs:
           TESTS="${{ github.event.inputs.tests_to_run || 'test/test_autograd.py' }}"
           start=$(date +%s)
 
+          # Use upstream's test/run_test.py orchestrator for max CI fidelity.
+          # It handles path setup, env vars, and matches what _linux-test.yml
+          # does internally. We pass --include with the bare test name (no .py
+          # extension and no test/ prefix), which is run_test.py's expected form.
+          # E.g. test/test_autograd.py -> --include test_autograd
+          INCLUDE_NAME=$(echo "$TESTS" | sed -E 's|^test/||; s|\.py$||; s|::.*||')
+
           set -x
           set +e
           sudo docker exec "$CID" bash -c "
@@ -211,10 +222,7 @@ jobs:
             export PYTORCH_TEST_WITH_DYNAMO=0
             export TEST_WITH_TORCHDYNAMO=0
             export TEST_WITH_SLOW=0
-            python -m pytest $TESTS \
-              --timeout=300 --no-header \
-              -rs --maxfail=30 \
-              --tb=short -q
+            python test/run_test.py --include $INCLUDE_NAME --verbose 2>&1 | tail -200
           "
           test_rc=$?
           set -e
@@ -225,14 +233,8 @@ jobs:
           echo "test_exit_code=$test_rc" >> "$GITHUB_OUTPUT"
           echo "Test slice wall-clock: $((end - start))s, exit code: $test_rc"
 
-          if [ "$test_rc" = "5" ]; then
-              echo "::error::No tests collected"
-              exit 1
-          elif [ "$test_rc" = "2" ]; then
-              echo "::error::pytest interrupted (likely --maxfail)"
-              exit 1
-          elif [ "$test_rc" != "0" ]; then
-              echo "::warning::pytest exited with code $test_rc — see log above"
+          if [ "$test_rc" != "0" ]; then
+              echo "::warning::run_test.py exited with code $test_rc"
               exit 1
           fi
 
