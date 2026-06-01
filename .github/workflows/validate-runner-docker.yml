@@ -229,9 +229,10 @@ jobs:
             sudo chown -R jenkins /var/lib/jenkins/workspace
             git config --global --add safe.directory /var/lib/jenkins/workspace
             cd /var/lib/jenkins/workspace
-            # Fix scipy/numpy ABI incompatibility in the image
-            python -c 'import scipy.special._ufuncs' 2>&1 | head -2 || \\
-                pip install --quiet 'numpy<2'
+            # build.sh installs numpy==2.0.2, which is incompatible with the
+            # image's scipy 1.10.1 (built for numpy<1.27). Downgrade numpy
+            # to fix the ABI mismatch before running tests.
+            python -mpip install --quiet 'numpy<2'
             INCLUDE_NAME=\$(echo '$TESTS' | sed -E 's|^test/||; s|\\.py\$||; s|::.*||')
             echo \"Running upstream run_test.py --include \$INCLUDE_NAME\"
             python test/run_test.py --include \$INCLUDE_NAME --verbose
