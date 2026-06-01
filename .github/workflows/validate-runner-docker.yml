@@ -200,6 +200,118 @@ jobs:
           PY
           '
 
+      - name: Baseline benchmark
+        id: bench
+        run: |
+          set -e
+          CID='${{ steps.start.outputs.container_id }}'
+          start=$(date +%s)
+          # Show what backends are linked (so we know what we're measuring)
+          sudo docker exec "$CID" bash -c '
+            cd /tmp
+            python -c "import torch; print(torch.__config__.show())" \
+                | grep -iE "USE_OPENMP|USE_MKLDNN|MKLDNN_ACL|kleidi|onednn|BLAS_INFO|NEON|ARM|aarch64" \
+                | head -30
+          ' 2>&1 | tee /tmp/bench-config.log || true
+          echo "==============================================="
+
+          # Run the benchmark itself. Self-contained Python script.
+          sudo docker exec "$CID" bash -c '
+            cd /tmp
+            python <<PY
+          import torch
+          import torch.utils.benchmark as bm
+          import time
+
+          torch.manual_seed(0)
+          torch.set_num_threads(96)  # m9g.24xlarge
+
+          print(f"\n===== Baseline benchmark on {torch.__version__} =====")
+          print(f"threads={torch.get_num_threads()}")
+
+          def t(stmt, setup, label, num_threads=None, **kw):
+              timer = bm.Timer(
+                  stmt=stmt, setup=setup, label=label,
+                  num_threads=num_threads or torch.get_num_threads(),
+                  globals=kw,
+              )
+              m = timer.blocked_autorange(min_run_time=0.5)
+              return m
+
+          # ---- matmul: fp32 ----
+          print("\n--- matmul fp32 ---")
+          for n in (512, 1024, 2048, 4096):
+              a = torch.randn(n, n)
+              b = torch.randn(n, n)
+              m = t("a @ b", "", f"matmul {n}x{n} fp32", a=a, b=b)
+              gflops = (2 * n**3) / (m.median * 1e9)
+              print(f"  {n}x{n}: median={m.median*1e3:7.2f}ms  iqr={m.iqr*1e3:6.2f}ms  -> {gflops:7.1f} GFLOP/s")
+
+          # ---- matmul: bf16 ----
+          print("\n--- matmul bf16 ---")
+          for n in (512, 1024, 2048, 4096):
+              a = torch.randn(n, n, dtype=torch.bfloat16)
+              b = torch.randn(n, n, dtype=torch.bfloat16)
+              m = t("a @ b", "", f"matmul {n}x{n} bf16", a=a, b=b)
+              gflops = (2 * n**3) / (m.median * 1e9)
+              print(f"  {n}x{n}: median={m.median*1e3:7.2f}ms  iqr={m.iqr*1e3:6.2f}ms  -> {gflops:7.1f} GFLOP/s")
+
+          # ---- linear layer forward+backward (transformer-ish dim) ----
+          print("\n--- linear fwd+bwd (B=32, in=4096, out=4096) ---")
+          for dtype in (torch.float32, torch.bfloat16):
+              x = torch.randn(32, 4096, dtype=dtype, requires_grad=True)
+              w = torch.randn(4096, 4096, dtype=dtype, requires_grad=True)
+              m_fwd = t("y = x @ w.t()", "", f"linear-fwd {dtype}", x=x, w=w)
+              m_bwd = t(
+                  "y = x @ w.t(); y.sum().backward(); x.grad=None; w.grad=None",
+                  "", f"linear-fwd+bwd {dtype}", x=x, w=w,
+              )
+              print(f"  {dtype}: fwd={m_fwd.median*1e3:6.2f}ms   fwd+bwd={m_bwd.median*1e3:6.2f}ms")
+
+          # ---- conv2d ----
+          print("\n--- conv2d (1, 64, 224, 224) -> 64 ch, k=3 ---")
+          for layout in ("NCHW", "channels_last"):
+              x = torch.randn(1, 64, 224, 224)
+              if layout == "channels_last":
+                  x = x.contiguous(memory_format=torch.channels_last)
+              conv = torch.nn.Conv2d(64, 64, 3, padding=1)
+              if layout == "channels_last":
+                  conv = conv.to(memory_format=torch.channels_last)
+              m = t("conv(x)", "", f"conv2d {layout}", conv=conv, x=x)
+              print(f"  {layout}: median={m.median*1e3:6.2f}ms  iqr={m.iqr*1e3:6.2f}ms")
+
+          # ---- scaled_dot_product_attention ----
+          print("\n--- scaled_dot_product_attention (B=4, H=16, S=512, D=64) ---")
+          if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+              for dtype in (torch.float32, torch.bfloat16):
+                  q = torch.randn(4, 16, 512, 64, dtype=dtype)
+                  k = torch.randn(4, 16, 512, 64, dtype=dtype)
+                  v = torch.randn(4, 16, 512, 64, dtype=dtype)
+                  m = t(
+                      "torch.nn.functional.scaled_dot_product_attention(q, k, v)",
+                      "", f"sdpa {dtype}", q=q, k=k, v=v,
+                  )
+                  print(f"  {dtype}: median={m.median*1e3:6.2f}ms")
+
+          # ---- thread-scaling sweep (matmul 2048 fp32) ----
+          print("\n--- matmul 2048x2048 fp32 thread sweep ---")
+          for nt in (1, 4, 16, 24, 48, 96):
+              a = torch.randn(2048, 2048)
+              b = torch.randn(2048, 2048)
+              m = t("a @ b", "", f"matmul-2048 nt={nt}", num_threads=nt, a=a, b=b)
+              gflops = (2 * 2048**3) / (m.median * 1e9)
+              print(f"  threads={nt:3d}: {m.median*1e3:7.2f}ms  -> {gflops:7.1f} GFLOP/s")
+
+          torch.set_num_threads(96)
+          print("\nbaseline benchmark complete")
+          PY
+          '
+          rc=$?
+          end=$(date +%s)
+          echo "bench_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "bench_exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "Benchmark wall-clock: $((end - start))s, exit code: $rc"
+
       - name: Targeted test slice
         id: tests
         run: |
