@@ -213,27 +213,36 @@ jobs:
             env | grep -i acl || true
             ls -la /acl 2>&1 | head -5
             echo
-            echo "===== torch.__config__ (full) ====="
-            python -c "import torch; print(torch.__config__.show())"
+            echo "===== ACL linkage check ====="
+            TORCH_LIB=$(python -c "import torch, os; print(os.path.dirname(torch.__file__) + \"/lib\")")
+            echo "Looking in: $TORCH_LIB"
+            ls -la "$TORCH_LIB"/libtorch_cpu.so 2>&1 | head -3
+            echo "--- ldd (dynamic deps) ---"
+            ldd "$TORCH_LIB"/libtorch_cpu.so 2>&1 | grep -iE "acl|compute|lib(blas|lapack|mkl|openblas)" | head -10
+            echo "--- nm/strings probe for ARM Compute Library symbols ---"
+            # Look for arm_compute namespace symbols. If they exist, ACL is statically linked.
+            nm -D --defined-only "$TORCH_LIB"/libtorch_cpu.so 2>/dev/null | grep -E "arm_compute" | head -5 || echo "(nm: no defined arm_compute symbols)"
+            echo "--- count of arm_compute references ---"
+            { strings "$TORCH_LIB"/libtorch_cpu.so 2>/dev/null | grep -cE "arm_compute|ComputeLibrary"; } 2>&1 || true
             echo
-            echo "===== torch backends ====="
+            echo "===== ONEDNN_VERBOSE matmul probe ====="
+            # Newer oneDNN renamed DNNL_VERBOSE to ONEDNN_VERBOSE. Set both to be safe.
+            # Use a 4096x4096 matmul so oneDNN definitely engages (small ones go to direct loops).
+            ONEDNN_VERBOSE=1 DNNL_VERBOSE=1 python -c "
+          import torch
+          a = torch.randn(4096, 4096)
+          b = torch.randn(4096, 4096)
+          for _ in range(2):
+              c = a @ b
+          print(\"---probe done---\")
+          " 2>&1 | grep -iE "onednn|dnnl|verbose|exec|aarch64|acl|gemm|matmul" | head -20 || true
+            echo
+            echo "===== torch backends (short) ====="
             python -c "
           import torch
           print(\"mkldnn available:\", torch.backends.mkldnn.is_available())
-          print(\"mkldnn version:\", torch.backends.mkldnn.version())
-          print(\"openmp available:\", torch.backends.openmp.is_available())
           print(\"cpu capability:\", torch.backends.cpu.get_cpu_capability() if hasattr(torch.backends, \"cpu\") else \"n/a\")
           "
-            echo
-            echo "===== DNNL_VERBOSE matmul probe — shows if ACL kernel is selected ====="
-            DNNL_VERBOSE=1 python -c "
-          import torch
-          a = torch.randn(1024, 1024)
-          b = torch.randn(1024, 1024)
-          for _ in range(3):
-              c = a @ b
-          print(\"---matmul probe done---\")
-          " 2>&1 | grep -E "onednn|dnnl_verbose|exec|aarch64|acl|gemm" | head -20
           ' 2>&1 | tee /tmp/bench-config.log || true
           echo "==============================================="
 
