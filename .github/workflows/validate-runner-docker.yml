@@ -201,7 +201,7 @@ jobs:
         run: |
           set -e
           CID='${{ steps.start.outputs.container_id }}'
-          TESTS='${{ github.event.inputs.tests_to_run || ''test/test_autograd.py'' }}'
+          TESTS="${{ github.event.inputs.tests_to_run || 'test/test_autograd.py' }}"
           start=$(date +%s)
 
           set -x
