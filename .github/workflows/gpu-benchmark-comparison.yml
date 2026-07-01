@@ -24,13 +24,49 @@ on:
         description: 'PyTorch install channel: nightly or stable'
         required: false
         default: 'nightly'
+  # Also support tag-triggered runs so we can drive this without workflow_dispatch API perms.
+  # Tag format: bench-{label}-NNN e.g. bench-g5-001, bench-g6-001, bench-g7-001.
+  # The workflow derives runner_label = pytorch-validation-{label}-4xlarge from the tag.
+  push:
+    tags:
+      - 'bench-*'
 
 permissions:
   contents: read
 
 jobs:
+  # Small helper job to compute the effective label + runner_label from either
+  # workflow_dispatch inputs or the pushed tag name.
+  resolve-inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.compute.outputs.label }}
+      runner_label: ${{ steps.compute.outputs.runner_label }}
+      torch_channel: ${{ steps.compute.outputs.torch_channel }}
+    steps:
+      - name: Compute inputs
+        id: compute
+        run: |
+          set -e
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            LABEL="${{ needs.resolve-inputs.outputs.label }}"
+            RUNNER_LABEL="${{ needs.resolve-inputs.outputs.runner_label }}"
+            TORCH_CHANNEL="${{ needs.resolve-inputs.outputs.torch_channel }}"
+          else
+            # Parse tag: refs/tags/bench-g5-001 -> label=g5
+            TAG="${GITHUB_REF##refs/tags/}"
+            LABEL=$(echo "$TAG" | sed -E 's/^bench-([a-z0-9]+)-.*$/\1/')
+            RUNNER_LABEL="pytorch-validation-${LABEL}-4xlarge"
+            TORCH_CHANNEL="nightly"
+          fi
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "runner_label=$RUNNER_LABEL" >> "$GITHUB_OUTPUT"
+          echo "torch_channel=$TORCH_CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "Resolved: label=$LABEL runner=$RUNNER_LABEL channel=$TORCH_CHANNEL"
+
   gpu-benchmark:
-    runs-on: ${{ github.event.inputs.runner_label }}
+    needs: resolve-inputs
+    runs-on: ${{ needs.resolve-inputs.outputs.runner_label }}
     timeout-minutes: 90
 
     steps:
@@ -61,13 +97,13 @@ jobs:
           python3 -m venv "$HOME/bench-venv"
           "$HOME/bench-venv/bin/python" -m pip install --upgrade pip wheel
 
-      - name: Install PyTorch (${{ github.event.inputs.torch_channel }} + CUDA 12.8)
+      - name: Install PyTorch (${{ needs.resolve-inputs.outputs.torch_channel }} + CUDA 12.8)
         id: install
         run: |
           set -ex
           source "$HOME/bench-venv/bin/activate"
           start=$(date +%s)
-          if [[ "${{ github.event.inputs.torch_channel }}" == "nightly" ]]; then
+          if [[ "${{ needs.resolve-inputs.outputs.torch_channel }}" == "nightly" ]]; then
             # Nightly wheel with sm_120 (Blackwell RTX) support requires CUDA 12.8
             pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
           else
@@ -111,7 +147,7 @@ jobs:
           source "$HOME/bench-venv/bin/activate"
           mkdir -p /tmp/bench-results
 
-          python - <<'PY' 2>&1 | tee /tmp/bench-results/${{ github.event.inputs.label }}.log
+          python - <<'PY' 2>&1 | tee /tmp/bench-results/${{ needs.resolve-inputs.outputs.label }}.log
           import json, os, platform, subprocess, time
           import torch
           import torch.nn.functional as F
@@ -323,13 +359,13 @@ jobs:
           print(json.dumps(RESULTS, indent=2))
           PY
         env:
-          BENCH_LABEL: ${{ github.event.inputs.label }}
+          BENCH_LABEL: ${{ needs.resolve-inputs.outputs.label }}
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: gpu-bench-${{ github.event.inputs.label }}
+          name: gpu-bench-${{ needs.resolve-inputs.outputs.label }}
           path: /tmp/bench-results/
           retention-days: 30
 
@@ -337,12 +373,12 @@ jobs:
         if: always()
         run: |
           echo "======================================================"
-          echo "GPU Benchmark Summary - ${{ github.event.inputs.label }}"
+          echo "GPU Benchmark Summary - ${{ needs.resolve-inputs.outputs.label }}"
           echo "======================================================"
           echo "Runner: ${{ runner.name }}"
           echo "Runner labels: ${{ join(runner.labels, ', ') }}"
           echo "Install seconds: ${{ steps.install.outputs.install_seconds }}"
           echo "------------------------------------------------------"
-          if [[ -f /tmp/bench-results/${{ github.event.inputs.label }}.json ]]; then
-            cat /tmp/bench-results/${{ github.event.inputs.label }}.json | python3 -m json.tool
+          if [[ -f /tmp/bench-results/${{ needs.resolve-inputs.outputs.label }}.json ]]; then
+            cat /tmp/bench-results/${{ needs.resolve-inputs.outputs.label }}.json | python3 -m json.tool
           fi
