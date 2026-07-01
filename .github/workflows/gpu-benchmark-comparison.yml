@@ -103,11 +103,13 @@ jobs:
           set -ex
           source "$HOME/bench-venv/bin/activate"
           start=$(date +%s)
+          # torch only (no torchvision - benchmark doesn't use it and the nightly
+          # index sometimes has torch/torchvision date mismatches that break pip resolution)
           if [[ "${{ needs.resolve-inputs.outputs.torch_channel }}" == "nightly" ]]; then
             # Nightly wheel with sm_120 (Blackwell RTX) support requires CUDA 12.8
-            pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+            pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
           else
-            pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+            pip install torch --index-url https://download.pytorch.org/whl/cu128
           fi
           end=$(date +%s)
           echo "install_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
