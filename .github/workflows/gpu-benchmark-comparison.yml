@@ -1,0 +1,348 @@
+name: gpu-benchmark-comparison
+
+# Reusable GPU benchmark workflow for comparing EC2 GPU instance types
+# (g5.4xlarge / g6.4xlarge / g7.4xlarge) as candidate PyTorch CI runners.
+#
+# Trigger once per runner:
+#   gh workflow run gpu-benchmark-comparison.yml \
+#     -f runner_label=pytorch-validation-g5-4xlarge \
+#     -f label=g5
+#
+# Outputs a structured JSON summary in the job log for cross-run analysis.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label to target (e.g. pytorch-validation-g5-4xlarge)'
+        required: true
+      label:
+        description: 'Short label for this run (g5, g6, g7)'
+        required: true
+        default: 'gpu'
+      torch_channel:
+        description: 'PyTorch install channel: nightly or stable'
+        required: false
+        default: 'nightly'
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-benchmark:
+    runs-on: ${{ github.event.inputs.runner_label }}
+    timeout-minutes: 90
+
+    steps:
+      - name: Runner identity
+        run: |
+          set -ex
+          echo "=== System ==="
+          uname -a
+          nproc
+          free -h
+          df -h /
+          echo ""
+          echo "=== CPU ==="
+          lscpu | grep -E "Model name|Vendor ID|Socket|Thread|Core|Flags" | head -20
+          echo ""
+          echo "=== GPU (nvidia-smi) ==="
+          nvidia-smi || echo "nvidia-smi not yet available"
+          echo ""
+          echo "=== GPU details ==="
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version,pcie.link.gen.current,pcie.link.width.current --format=csv || true
+
+      - name: Install Python + venv
+        run: |
+          set -ex
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3 python3-dev python3-venv python3-pip
+          python3 -m venv "$HOME/bench-venv"
+          "$HOME/bench-venv/bin/python" -m pip install --upgrade pip wheel
+
+      - name: Install PyTorch (${{ github.event.inputs.torch_channel }} + CUDA 12.8)
+        id: install
+        run: |
+          set -ex
+          source "$HOME/bench-venv/bin/activate"
+          start=$(date +%s)
+          if [[ "${{ github.event.inputs.torch_channel }}" == "nightly" ]]; then
+            # Nightly wheel with sm_120 (Blackwell RTX) support requires CUDA 12.8
+            pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+          else
+            pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+          fi
+          end=$(date +%s)
+          echo "install_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "Install wall-clock: $((end - start))s"
+
+      - name: Environment sanity + smoke
+        run: |
+          set -ex
+          source "$HOME/bench-venv/bin/activate"
+          python <<'PY'
+          import torch, platform
+          print(f"python: {platform.python_version()}")
+          print(f"torch: {torch.__version__}")
+          print(f"cuda available: {torch.cuda.is_available()}")
+          if torch.cuda.is_available():
+              print(f"cuda version: {torch.version.cuda}")
+              print(f"device count: {torch.cuda.device_count()}")
+              for i in range(torch.cuda.device_count()):
+                  props = torch.cuda.get_device_properties(i)
+                  print(f"device {i}: {props.name}")
+                  print(f"  compute capability: sm_{props.major}{props.minor}")
+                  print(f"  total memory: {props.total_memory / 1024**3:.1f} GB")
+                  print(f"  multi_processor_count: {props.multi_processor_count}")
+              # Quick sanity op
+              a = torch.randn(128, 128, device='cuda')
+              b = a @ a
+              torch.cuda.synchronize()
+              print(f"smoke matmul norm: {b.norm().item():.3f}")
+          else:
+              raise SystemExit("CUDA not available - aborting benchmark")
+          PY
+
+      - name: Run benchmark suite
+        id: benchmark
+        run: |
+          set -e
+          source "$HOME/bench-venv/bin/activate"
+          mkdir -p /tmp/bench-results
+
+          python - <<'PY' 2>&1 | tee /tmp/bench-results/${{ github.event.inputs.label }}.log
+          import json, os, platform, subprocess, time
+          import torch
+          import torch.nn.functional as F
+          from torch.utils.benchmark import Timer
+
+          LABEL = os.environ.get("BENCH_LABEL", "gpu")
+          RESULTS = {"label": LABEL, "results": {}}
+
+          # ------------------------------------------------------------------
+          # Environment metadata
+          # ------------------------------------------------------------------
+          props = torch.cuda.get_device_properties(0)
+          RESULTS["env"] = {
+              "torch": torch.__version__,
+              "cuda": torch.version.cuda,
+              "gpu": props.name,
+              "compute_capability": f"sm_{props.major}{props.minor}",
+              "gpu_mem_gb": round(props.total_memory / 1024**3, 1),
+              "sm_count": props.multi_processor_count,
+              "python": platform.python_version(),
+              "cpu": platform.processor() or subprocess.check_output(
+                  ["bash", "-c", "lscpu | awk -F: '/Model name/ {gsub(/^ +/, \"\", $2); print $2; exit}'"]
+              ).decode().strip(),
+              "num_threads": os.cpu_count(),
+          }
+          print(f"\n=== ENV: {json.dumps(RESULTS['env'], indent=2)} ===\n")
+
+          def bench(label, stmt, globals_dict, min_run_time=1.0):
+              """Run one benchmark, capture median time in ms + throughput."""
+              torch.cuda.synchronize()
+              t = Timer(stmt=stmt, globals=globals_dict).blocked_autorange(
+                  min_run_time=min_run_time
+              )
+              torch.cuda.synchronize()
+              return {
+                  "median_ms": round(t.median * 1000, 4),
+                  "iqr_ms": round(t.iqr * 1000, 4),
+                  "num_measurements": t.number_per_run * len(t.times),
+              }
+
+          # ==================================================================
+          # matmul across dtypes + sizes
+          # ==================================================================
+          print("=== matmul ===")
+          for dtype_name, dtype in [("fp32", torch.float32),
+                                     ("fp16", torch.float16),
+                                     ("bf16", torch.bfloat16)]:
+              for size in [1024, 2048, 4096, 8192]:
+                  a = torch.randn(size, size, device='cuda', dtype=dtype)
+                  b = torch.randn(size, size, device='cuda', dtype=dtype)
+                  # Warmup
+                  for _ in range(3):
+                      _ = a @ b
+                  torch.cuda.synchronize()
+                  key = f"matmul_{dtype_name}_{size}"
+                  r = bench(key, "a @ b", {"a": a, "b": b})
+                  # TFLOP/s: 2 * N^3 flops per matmul
+                  tflops = (2 * size**3) / (r["median_ms"] / 1000) / 1e12
+                  r["tflops"] = round(tflops, 2)
+                  r["size"] = size
+                  r["dtype"] = dtype_name
+                  RESULTS["results"][key] = r
+                  print(f"  {key}: {r['median_ms']:.3f} ms, {tflops:.1f} TFLOP/s")
+                  del a, b
+                  torch.cuda.empty_cache()
+
+          # ==================================================================
+          # FP8 matmul (only on sm_89+)
+          # ==================================================================
+          if props.major >= 9 or (props.major == 8 and props.minor >= 9):
+              print("=== fp8 matmul (sm_89+) ===")
+              try:
+                  # Requires torch._scaled_mm on Ada Lovelace / Blackwell
+                  for size in [1024, 2048, 4096]:
+                      a = torch.randn(size, size, device='cuda').to(torch.float8_e4m3fn)
+                      b = torch.randn(size, size, device='cuda').to(torch.float8_e4m3fn).t().contiguous().t()
+                      scale_a = torch.tensor(1.0, device='cuda', dtype=torch.float32)
+                      scale_b = torch.tensor(1.0, device='cuda', dtype=torch.float32)
+                      # Warmup
+                      for _ in range(3):
+                          _ = torch._scaled_mm(a, b, scale_a=scale_a, scale_b=scale_b, out_dtype=torch.bfloat16)
+                      torch.cuda.synchronize()
+                      key = f"matmul_fp8_{size}"
+                      r = bench(key,
+                                "torch._scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)",
+                                {"a": a, "b": b, "sa": scale_a, "sb": scale_b, "torch": torch})
+                      tflops = (2 * size**3) / (r["median_ms"] / 1000) / 1e12
+                      r["tflops"] = round(tflops, 2)
+                      r["size"] = size
+                      r["dtype"] = "fp8_e4m3"
+                      RESULTS["results"][key] = r
+                      print(f"  {key}: {r['median_ms']:.3f} ms, {tflops:.1f} TFLOP/s")
+                      del a, b
+                      torch.cuda.empty_cache()
+              except Exception as e:
+                  print(f"  fp8 benchmark failed: {e}")
+                  RESULTS["results"]["fp8_error"] = str(e)
+
+          # ==================================================================
+          # Scaled Dot-Product Attention (transformer workload)
+          # ==================================================================
+          print("=== SDPA (scaled_dot_product_attention) ===")
+          for dtype_name, dtype in [("fp16", torch.float16), ("bf16", torch.bfloat16)]:
+              for (B, H, S, D) in [(4, 16, 512, 64),
+                                    (4, 16, 2048, 64),
+                                    (2, 32, 4096, 128)]:
+                  q = torch.randn(B, H, S, D, device='cuda', dtype=dtype)
+                  k = torch.randn(B, H, S, D, device='cuda', dtype=dtype)
+                  v = torch.randn(B, H, S, D, device='cuda', dtype=dtype)
+                  for _ in range(3):
+                      _ = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                  torch.cuda.synchronize()
+                  key = f"sdpa_{dtype_name}_B{B}_H{H}_S{S}_D{D}"
+                  r = bench(key,
+                            "F.scaled_dot_product_attention(q, k, v, is_causal=True)",
+                            {"F": F, "q": q, "k": k, "v": v})
+                  r["dtype"] = dtype_name
+                  r["shape"] = f"B={B},H={H},S={S},D={D}"
+                  RESULTS["results"][key] = r
+                  print(f"  {key}: {r['median_ms']:.3f} ms")
+                  del q, k, v
+                  torch.cuda.empty_cache()
+
+          # ==================================================================
+          # Conv2d (ResNet-like block)
+          # ==================================================================
+          print("=== conv2d ===")
+          for dtype_name, dtype in [("fp16", torch.float16), ("bf16", torch.bfloat16)]:
+              for (B, C, HW) in [(32, 64, 224), (32, 256, 56), (32, 512, 28)]:
+                  x = torch.randn(B, C, HW, HW, device='cuda', dtype=dtype).to(memory_format=torch.channels_last)
+                  conv = torch.nn.Conv2d(C, C, 3, padding=1).to(device='cuda', dtype=dtype, memory_format=torch.channels_last)
+                  for _ in range(3):
+                      _ = conv(x)
+                  torch.cuda.synchronize()
+                  key = f"conv2d_{dtype_name}_B{B}_C{C}_HW{HW}"
+                  r = bench(key, "conv(x)", {"conv": conv, "x": x})
+                  r["dtype"] = dtype_name
+                  r["shape"] = f"B={B},C={C},HW={HW}"
+                  RESULTS["results"][key] = r
+                  print(f"  {key}: {r['median_ms']:.3f} ms")
+                  del x, conv
+                  torch.cuda.empty_cache()
+
+          # ==================================================================
+          # Linear forward+backward (training step surrogate)
+          # ==================================================================
+          print("=== linear fwd+bwd ===")
+          for dtype_name, dtype in [("fp16", torch.float16), ("bf16", torch.bfloat16)]:
+              for (B, D) in [(32, 4096), (64, 4096), (128, 4096)]:
+                  lin = torch.nn.Linear(D, D).to(device='cuda', dtype=dtype)
+                  x = torch.randn(B, D, device='cuda', dtype=dtype, requires_grad=True)
+                  for _ in range(3):
+                      y = lin(x); y.sum().backward(); x.grad = None
+                  torch.cuda.synchronize()
+                  key = f"linear_fwdbwd_{dtype_name}_B{B}_D{D}"
+                  r = bench(key,
+                            "y = lin(x); y.sum().backward(); x.grad = None",
+                            {"lin": lin, "x": x})
+                  r["dtype"] = dtype_name
+                  r["shape"] = f"B={B},D={D}"
+                  RESULTS["results"][key] = r
+                  print(f"  {key}: {r['median_ms']:.3f} ms")
+                  del lin, x
+                  torch.cuda.empty_cache()
+
+          # ==================================================================
+          # torch.compile smoke — matters for inductor CI perf
+          # ==================================================================
+          print("=== torch.compile ===")
+          try:
+              class Block(torch.nn.Module):
+                  def __init__(self, d=1024):
+                      super().__init__()
+                      self.a = torch.nn.Linear(d, 4*d)
+                      self.b = torch.nn.Linear(4*d, d)
+                  def forward(self, x):
+                      return self.b(F.gelu(self.a(x)))
+
+              model = Block(1024).cuda().to(torch.bfloat16)
+              x = torch.randn(64, 1024, device='cuda', dtype=torch.bfloat16)
+
+              # Compile time
+              compiled = torch.compile(model, mode="reduce-overhead")
+              t0 = time.perf_counter()
+              _ = compiled(x)   # triggers first-call compile
+              torch.cuda.synchronize()
+              compile_seconds = time.perf_counter() - t0
+              print(f"  compile_first_call_seconds: {compile_seconds:.2f}")
+
+              # Steady-state
+              for _ in range(3):
+                  _ = compiled(x)
+              torch.cuda.synchronize()
+              r = bench("compiled_block", "compiled(x)", {"compiled": compiled, "x": x})
+              r["compile_seconds"] = round(compile_seconds, 3)
+              RESULTS["results"]["compiled_block_bf16"] = r
+              print(f"  compiled forward: {r['median_ms']:.3f} ms (compile: {compile_seconds:.2f} s)")
+          except Exception as e:
+              print(f"  torch.compile benchmark failed: {e}")
+              RESULTS["results"]["compile_error"] = str(e)
+
+          # ==================================================================
+          # Persist JSON
+          # ==================================================================
+          out_path = f"/tmp/bench-results/{LABEL}.json"
+          with open(out_path, "w") as f:
+              json.dump(RESULTS, f, indent=2)
+          print(f"\n=== Wrote {out_path} ===")
+          print(json.dumps(RESULTS, indent=2))
+          PY
+        env:
+          BENCH_LABEL: ${{ github.event.inputs.label }}
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-bench-${{ github.event.inputs.label }}
+          path: /tmp/bench-results/
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "======================================================"
+          echo "GPU Benchmark Summary - ${{ github.event.inputs.label }}"
+          echo "======================================================"
+          echo "Runner: ${{ runner.name }}"
+          echo "Runner labels: ${{ join(runner.labels, ', ') }}"
+          echo "Install seconds: ${{ steps.install.outputs.install_seconds }}"
+          echo "------------------------------------------------------"
+          if [[ -f /tmp/bench-results/${{ github.event.inputs.label }}.json ]]; then
+            cat /tmp/bench-results/${{ github.event.inputs.label }}.json | python3 -m json.tool
+          fi
